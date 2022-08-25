@@ -9,7 +9,8 @@ from util import *
 
 
 class MultiGPR:
-    # Conditionally independent mlti-output Gaussian Process Regression from Deisenroth et al. (2017)
+    # Conditionally independent multi-output Gaussian Process Regression from Deisenroth et al. (2017)
+    # This is a base model for components in PILCO
     def __init__(self, input_dim, output_dim, kernel=None, **kwargs):
         self.input_dim = input_dim      # (D)
         self.output_dim = output_dim    # (F)
@@ -41,9 +42,9 @@ class MultiGPR:
                 else:
                     pass
     
-    def predict(self, x, joint=False, deterministic=False):
-        # Input: scipy.stats.mltivariate_normal class object
-        # Output: scipy.stats.mltivariate_normal class object, input-output covariance matrix (C)
+    def predict(self, x, deterministic=False):
+        # Input: scipy.stats.mltivariate_normal class object (x)
+        # Output: scipy.stats.mltivariate_normal class object (m_new, S_new), input-output covariance matrix (C)
         m = x.mean  # (D)
         S = x.cov   # (D, D)
         m_new = np.zeros(self.output_dim)   # (F)
@@ -54,42 +55,28 @@ class MultiGPR:
         nu = self.X_train_ - m[None, :]    # (N, D)
         for i in range(self.output_dim):
             TI = np.linalg.inv(S + np.diag(self.length[i]))   # (D, D)
-            qs[i] = self.const[i] / np.sqrt(np.linalg.det(S @ np.diag(1 / self.length[i]) + np.eye(self.input_dim))) * np.diag(np.exp(-nu @ TI @ nu.T / 2))   # take log?
+            qs[i] = self.const[i] / np.sqrt(np.linalg.det(S @ np.diag(1 / self.length[i]) + np.eye(self.input_dim))) \
+                * np.diag(np.exp(-nu @ TI @ nu.T / 2))   # take log?
             m_new[i] = self.gps[i].alpha_.dot(qs[i])
             C[:, i] = np.dot(S @ TI @ nu.T , qs[i] * self.gps[i].alpha_)
 
-        # covariance matrix requires m_new (and it is PSD)
         for i in range(self.output_dim):
             for j in range(i, self.output_dim):
                 R = S @ (np.diag(1 / self.length[i]) + np.diag(1 / self.length[j])) + np.eye(self.input_dim)    # (D, D)
                 Zi = nu @ np.diag(1 / self.length[i]) # (N, D)
                 Zj = nu @ np.diag(1 / self.length[j]) # (N, D)
-                # due to the machine precision, take logarithm
-                # prefer to use the squared mahalanobis distance
-                # ln_Q = np.log(np.outer(self.gps[i].kernel_(self.X_train_, m[None, :]), self.gps[j].kernel_(self.X_train_, m[None, :]))) - np.log(np.linalg.det(R)) / 2 \
-                    # + smaha(Zi, -Zj, solve(R, S) / 2)
-                    # + np.square(cdist(Zi, -Zj, 'mahalanobis', VI=solve(R, S))) / 2
-
-                # this is the simplified version of computing Q from Eq. (2.53) in Deisenroth (2010)
-                ln_Q = np.log(self.const[i]) + np.log(self.const[j]) - (smaha(nu, Q=np.diag(1 / self.length[i])) + smaha(nu, Q=np.diag(1 / self.length[j])).T - smaha(Zi, -Zj, solve(R, S))) / 2
+                # the simplified version of computing Q from Eq. (2.53) in Deisenroth (2010)
+                ln_Q = np.log(self.const[i]) + np.log(self.const[j]) \
+                    - (smaha(nu, Q=np.diag(1 / self.length[i])) + smaha(nu, Q=np.diag(1 / self.length[j])).T - smaha(Zi, -Zj, solve(R, S))) / 2 # (N, N)
                 Q = np.exp(ln_Q)
                 Q /= np.sqrt(np.linalg.det(R))
-                
                 S_new[i, j] = self.gps[i].alpha_.dot(Q @ self.gps[j].alpha_) - m_new[i] * m_new[j]
                 S_new[j, i] = S_new[i, j]
                 if not deterministic:
                     if j == i:
-                        print('diagonal term', self.const[i] - np.trace(solve_triangular(self.gps[i].L_.T, solve_triangular(self.gps[i].L_, Q, lower=True), lower=False)))
                         S_new[i, j] += self.const[i] - np.trace(solve_triangular(self.gps[i].L_.T, solve_triangular(self.gps[i].L_, Q, lower=True), lower=False))
                 else:
-                    # i.e., in the case of deterministic GP (e.g., policy), it does not include the model uncertainty
-                    pass
-                S_new += np.eye(self.output_dim) * 1e-6     # add small jitter
-        print("model_S_eigvals", np.linalg.eigvalsh(S_new))
-        if joint:
-            m_new = np.hstack((m_new, m))
-            S_new = np.block([[S, C], [C.T, S_new]])
-            return stats.multivariate_normal(m_new, S_new), C
+                    pass    # in the case of deterministic (e.g., RBFPolicy), the model uncertainty is not considered
         else:
             return stats.multivariate_normal(m_new, S_new), C
 
@@ -97,7 +84,7 @@ class MultiGPR:
 class RBFPolicy(MultiGPR):
     def __init__(self, state_dim, control_dim, level=30, u_max=1.0, kernel=None, **kwargs):
         if kernel is None:
-            kernel = C(1.0, 'fixed') * RBF(np.exp(np.random.randn(state_dim)), 'fixed')
+            kernel = C(1.0, 'fixed') * RBF(np.exp(np.random.randn(state_dim)), 'fixed') # use a fixed kernel
         else:
             kernel = kernel
         super().__init__(state_dim, control_dim, kernel=kernel, alpha=1e-2, **kwargs)
@@ -117,7 +104,7 @@ class RBFPolicy(MultiGPR):
         self.update(theta)
     
     def update(self, theta):
-        # theta is a vector, in which the length_scale is taken logarithm
+        # theta is a vector, in which length_scale values are taken logarithm
         self.M, self.T, self.Lambda = np.split(theta, np.cumsum(np.multiply(*self.theta_dims.T))[:-1])
         self.M = self.M.reshape(*self.theta_dims[0])
         self.T = self.T.reshape(*self.theta_dims[1])
@@ -137,26 +124,25 @@ class RBFPolicy(MultiGPR):
         q = np.exp(lq)
         S_new = (np.exp(lq + S) - q) * np.cos(m[:, None] - m[None, :]) - (np.exp(lq - S) - q) * np.cos(m[:, None] + m[None, :])
         S_new = np.outer(self.u_max, self.u_max) * S_new / 2
-        C = self.u_max * np.diag(np.exp(-np.diag(S) / 2) * np.cos(m))
+        C = self.u_max * np.diag(np.exp(-np.diag(S) / 2) * np.cos(m))   # already inv(x.cov) is premultiplied
         return stats.multivariate_normal(m_new, S_new), C
     
     def get_action(self, x):
-        # get the moment-matched preliminary control (x, u_)
+        # get the moment-matched preliminary control (u_)
         u_, c_ = self.predict(x, deterministic=True)
-        # automatically involve a squash function
         u, c = self.squash_sin(u_) # squash u_ into [-1, 1] with the sine function (x, u)
         return u, c_ @ c
 
 
 class PILCO:
-    def __init__(self, state_dim, control_dim, policy=None, reward=None, x_init=None, horizon=20):
+    # reward should be a callable function that accepts multivariate normal random variable
+    def __init__(self, state_dim, control_dim, reward, policy=None, x_init=None, horizon=20):
         self.model = MultiGPR(state_dim + control_dim, state_dim)
         if policy is None:
             self.policy = RBFPolicy(state_dim, control_dim)
         else:
             self.policy = policy
         
-        # assert reward is callable
         self.reward = reward
         self.state_dim = state_dim
         self.control_dim = control_dim
@@ -164,16 +150,53 @@ class PILCO:
         if x_init == None:
             self.x_init = stats.multivariate_normal(np.zeros(self.state_dim), np.eye(self.state_dim))
         else:
-            self.x_init
+            self.x_init = x_init    # check x_init is a stats.multivariate_normal class object
 
     def train_model(self, X, y):
         assert X.shape[1] == self.state_dim + self.control_dim
         assert y.shape[1] == self.state_dim
         self.model.fit(X, y)
 
-    def optimize_policy(self, n_restarts=0):
+    def propagate(self, x):
+        assert self.model_trained   # check self.model is trained
+        # Input: a state vector (x; D)
+        # Output: action (u; F), a next state vector (x_new; D)
 
-        res = minimize(self.get_reward, np.random.randn(self.policy.theta_len))
+        # compute the approximate joint Gaussian distribution of x and u
+        u, c = self.policy.get_action(x)
+        m = np.hstack((x.mean, u.mean))
+        S = np.block([[x.cov, c], [c.T, u.cov]])
+        xu = stats.multivariate_normal(m, S)
+        
+        # compute the state differece with the model
+        d_x, dc = self.model.predict(xu)
+        mx_new = x.mean + d_x.mean
+        Sx_new = x.cov + d_x.cov + dc[:self.state_dim, :] + dc[:self.state_dim, :].T
+        x_new = stats.multivariate_normal(mx_new, Sx_new)
+        return xu, x_new
+
+    def run_episode(self, x):
+        t = 0
+        trace = []
+        reward = []
+        ep = namedtuple('episode', 'trace, reward')  # list of tuples: (state-action pair (MVN), reward) / maybe named tuple would be better
+        x_old = x
+        while t < self.horizon:
+            xu, x_new = self.propagate(x_old)
+            trace.append(xu)
+            reward.append(self.reward(x_old))
+            x_old = x_new
+            t += 1
+        return ep(trace, reward)
+    
+    def get_neg_reward(self, theta):
+        self.policy.update(theta)
+        episode = self.run_episode(self.x_init)
+        return -np.sum(episode.reward)
+
+    def optimize_policy(self, n_restarts=0):
+        assert self.model_trained   # check self.model is trained
+        res = minimize(self.get_neg_reward, np.random.randn(self.policy.theta_len))
         theta_new = res.x
         reward = res.fun
         if n_restarts > 0:
@@ -183,7 +206,7 @@ class PILCO:
             reward_ls.append(reward)
             while n_restarts > 0:
                 n_restarts -= 1
-                res = minimize(self.get_reward, np.random.randn(self.policy.theta_len))
+                res = minimize(self.get_neg_reward, np.random.randn(self.policy.theta_len))
                 theta_new = res.x
                 reward = res.fun
                 theta_ls.append(theta_new)
@@ -192,42 +215,6 @@ class PILCO:
             reward = reward_ls[np.argmin(reward_ls)]
         return theta_new, reward
 
-    def get_reward(self, theta):
-        self.policy.update(theta)
-        episode = self.run_episode(self.x_init)
-        return np.sum(episode.reward)
-
-    def run_episode(self, x):
-        # check self.model is trained before getting a trace
-        # equivalent function of predict of PILCO
-        T = self.horizon
-        trace = []
-        reward = []
-        ep = namedtuple('episode', 'trace, reward')  # list of tuples: (state-action pair (MVN), reward) / maybe named tuple would be better
-        x_old = x
-        for i in range(T):
-            print(i)
-            xu, x_new = self.propagate(x_old)
-            trace.append(xu)
-            reward.append(self.reward(x_old))
-            x_old = x_new        
-        return ep(trace, reward)
-
-    def propagate(self, x):
-        # Input: a state vector (x; D)
-        # Output: action (u; F), a next state vector (x_new; D)
-
-        # compute the approximate joint Gaussian distribution of x and u
-        u, c = self.policy.get_action(x)
-        m = np.hstack((x.mean, u.mean))
-        S = np.block([[x.cov, c], [c.T, u.cov]])
-        print("xu_cov_eigvals", np.linalg.eigvalsh(S))
-        xu = stats.multivariate_normal(m, S)
-        
-        # compute the state differece with the model
-        d_x, dc = self.model.predict(xu)
-        mx_new = x.mean + d_x.mean
-        Sx_new = x.cov + d_x.cov + dc[:self.state_dim, :] + dc[:self.state_dim, :].T
-        print("x_new_cov_eigvals", np.linalg.eigvalsh(Sx_new))
-        x_new = stats.multivariate_normal(mx_new, Sx_new)
-        return xu, x_new
+    @property
+    def model_trained(self):
+        return hasattr(self.model, 'X_train_')
